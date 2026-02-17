@@ -21,24 +21,23 @@ param(
     [string]$OutputFile = "correlated_clients.csv",
 
     [Parameter(Mandatory=$false)]
-    [switch]$SkipCertificateCheck = $true
+    [switch]$SkipCertificateCheck = $true,
+
+    [Parameter(Mandatory=$false)]
+    [ValidateSet("v1", "rest")]
+    [string]$ArubaApiVersion = "v1"
 )
 
-$ErrorActionPreference = "Stop"
-$verbosePref = $VerbosePreference
+$ErrorActionPreference = "Continue"
 $VerbosePreference = "Continue"
-
-$ErrorActionPreference = "Stop"
 
 class ArubaSession {
     [string]$BaseUrl
-    [string]$Token
     [hashtable]$Headers
 }
 
 class ClearPassSession {
     [string]$BaseUrl
-    [string]$Token
     [hashtable]$Headers
 }
 
@@ -50,30 +49,39 @@ function Connect-Aruba {
     )
 
     $baseUrl = "https://$Host"
-    $loginUrl = "$baseUrl/v1/api/login"
-
-    $body = @{
-        username = $Username
-        password = $Password
-    } | ConvertTo-Json
 
     try {
-        $response = Invoke-RestMethod -Uri $loginUrl -Method Post -Body $body -ContentType "application/json" -SkipCertificateCheck
-        $token = $response._global_result.HTTPCookie
+        $body = @{
+            username = $Username
+            password = $Password
+        } | ConvertTo-Json
+
+        $response = Invoke-RestMethod -Uri "$baseUrl/v1/api/login" -Method Post -Body $body -ContentType "application/json" -SkipCertificateCheck:$SkipCertificateCheck
+
+        $cookie = ""
+        if ($response.PSObject.Properties.Name.Contains("_global_result")) {
+            $cookie = $response._global_result.HTTPCookie
+        } elseif ($response.PSObject.Properties.Name.Contains("cookie")) {
+            $cookie = $response.cookie
+        }
+
+        if (-not $cookie) {
+            throw "Failed to extract session cookie from Aruba response"
+        }
 
         $headers = @{
-            "Cookie" = "SESSION=$token"
+            "Cookie" = $cookie
             "Content-Type" = "application/json"
         }
 
         return [ArubaSession]@{
             BaseUrl = $baseUrl
-            Token = $token
             Headers = $headers
         }
     }
     catch {
-        throw "Failed to authenticate to Aruba: $_"
+        Write-Error "Failed to authenticate to Aruba: $($_.Exception.Message)"
+        return $null
     }
 }
 
@@ -85,16 +93,16 @@ function Connect-ClearPass {
     )
 
     $baseUrl = "https://$Host"
-    $tokenUrl = "$baseUrl/api/oauth"
-
-    $body = @{
-        grant_type = "client_credentials"
-        client_id = $ClientId
-        client_secret = $ClientSecret
-    } | ConvertTo-Json
 
     try {
-        $response = Invoke-RestMethod -Uri $tokenUrl -Method Post -Body $body -ContentType "application/json" -SkipCertificateCheck
+        $body = @{
+            grant_type = "client_credentials"
+            client_id = $ClientId
+            client_secret = $ClientSecret
+        } | ConvertTo-Json
+
+        $response = Invoke-RestMethod -Uri "$baseUrl/api/oauth" -Method Post -Body $body -ContentType "application/json" -SkipCertificateCheck:$SkipCertificateCheck
+
         $token = $response.access_token
 
         $headers = @{
@@ -104,49 +112,50 @@ function Connect-ClearPass {
 
         return [ClearPassSession]@{
             BaseUrl = $baseUrl
-            Token = $token
             Headers = $headers
         }
     }
     catch {
-        throw "Failed to authenticate to ClearPass: $_"
+        Write-Error "Failed to authenticate to ClearPass: $($_.Exception.Message)"
+        return $null
     }
 }
 
-function Get-ArubaUserTable {
+function Get-ArubaClients {
     param([ArubaSession]$Session)
 
-    $url = "$($Session.BaseUrl)/v1/api/show-command?command=show+user-table"
-
     try {
-        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $Session.Headers -SkipCertificateCheck:$SkipCertificateCheck
-        if ($null -eq $response -or -not $response.PSObject.Properties.Name.Contains("user_table")) {
-            Write-Warning "No user_table found in Aruba response"
-            return [PSCustomObject]@{ user_table = @() }
-        }
-        return $response
+        $response = Invoke-RestMethod -Uri "$($Session.BaseUrl)/v1/clients" -Method Get -Headers $Session.Headers -SkipCertificateCheck:$SkipCertificateCheck
+        return @($response.clients)
     }
     catch {
-        Write-Error "Failed to fetch user table from Aruba: $($_.Exception.Message)"
-        return [PSCustomObject]@{ user_table = @() }
+        Write-Warning "Failed to fetch clients from Aruba: $($_.Exception.Message)"
+        return @()
     }
 }
 
-function Get-ArubaAccessList {
+function Get-ArubaAccessRules {
     param([ArubaSession]$Session)
 
-    $url = "$($Session.BaseUrl)/v1/api/show-command?command=show+ip+access-list"
-
     try {
-        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $Session.Headers -SkipCertificateCheck:$SkipCertificateCheck
-        if ($null -eq $response) {
-            Write-Warning "No response from Aruba access list query"
-            return @()
-        }
-        return @($response)
+        $response = Invoke-RestMethod -Uri "$($Session.BaseUrl)/v1/access-rules" -Method Get -Headers $Session.Headers -SkipCertificateCheck:$SkipCertificateCheck
+        return @($response.access_rules)
     }
     catch {
-        Write-Error "Failed to fetch access list from Aruba: $($_.Exception.Message)"
+        Write-Warning "Failed to fetch access rules from Aruba: $($_.Exception.Message)"
+        return @()
+    }
+}
+
+function Get-ArubaRoles {
+    param([ArubaSession]$Session)
+
+    try {
+        $response = Invoke-RestMethod -Uri "$($Session.BaseUrl)/v1/roles" -Method Get -Headers $Session.Headers -SkipCertificateCheck:$SkipCertificateCheck
+        return @($response.roles)
+    }
+    catch {
+        Write-Warning "Failed to fetch roles from Aruba: $($_.Exception.Message)"
         return @()
     }
 }
@@ -154,14 +163,12 @@ function Get-ArubaAccessList {
 function Get-ClearPassServices {
     param([ClearPassSession]$Session)
 
-    $url = "$($Session.BaseUrl)/api/service"
-
     try {
-        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $Session.Headers -SkipCertificateCheck:$SkipCertificateCheck
+        $response = Invoke-RestMethod -Uri "$($Session.BaseUrl)/api/service" -Method Get -Headers $Session.Headers -SkipCertificateCheck:$SkipCertificateCheck
         return @($response._embedded.services)
     }
     catch {
-        Write-Error "Failed to fetch services from ClearPass: $($_.Exception.Message)"
+        Write-Warning "Failed to fetch services from ClearPass: $($_.Exception.Message)"
         return @()
     }
 }
@@ -169,14 +176,12 @@ function Get-ClearPassServices {
 function Get-ClearPassRoleMappings {
     param([ClearPassSession]$Session)
 
-    $url = "$($Session.BaseUrl)/api/role-mapping"
-
     try {
-        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $Session.Headers -SkipCertificateCheck:$SkipCertificateCheck
+        $response = Invoke-RestMethod -Uri "$($Session.BaseUrl)/api/role-mapping" -Method Get -Headers $Session.Headers -SkipCertificateCheck:$SkipCertificateCheck
         return @($response._embedded.role_mappings)
     }
     catch {
-        Write-Error "Failed to fetch role mappings from ClearPass: $($_.Exception.Message)"
+        Write-Warning "Failed to fetch role mappings from ClearPass: $($_.Exception.Message)"
         return @()
     }
 }
@@ -184,50 +189,38 @@ function Get-ClearPassRoleMappings {
 function Get-ClearPassAuthenticationMethods {
     param([ClearPassSession]$Session)
 
-    $url = "$($Session.BaseUrl)/api/authentication-method"
-
     try {
-        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $Session.Headers -SkipCertificateCheck:$SkipCertificateCheck
+        $response = Invoke-RestMethod -Uri "$($Session.BaseUrl)/api/authentication-method" -Method Get -Headers $Session.Headers -SkipCertificateCheck:$SkipCertificateCheck
         return @($response._embedded.authentication_methods)
     }
     catch {
-        Write-Error "Failed to fetch authentication methods from ClearPass: $($_.Exception.Message)"
+        Write-Warning "Failed to fetch authentication methods from ClearPass: $($_.Exception.Message)"
         return @()
     }
 }
 
 function FindMatchingService {
-    param(
-        [array]$Services,
-        [string]$AuthMethod
-    )
+    param([array]$Services, [string]$AuthMethod)
 
-    if (-not $Services -or $Services.Count -eq 0) { return "Unknown" }
-    if (-not $AuthMethod) { return "Unknown" }
+    if (-not $Services -or $Services.Count -eq 0 -or -not $AuthMethod) { return "Unknown" }
 
     foreach ($service in $Services) {
         try {
-            $svcName = $service.name ?? "Unknown"
+            $svcName = $service.name ?? ""
             $svcAuth = $service.auth_method ?? ""
             if ($svcAuth -eq $AuthMethod -or $svcName -like "*$AuthMethod*") {
                 return $svcName
             }
         }
-        catch {
-            continue
-        }
+        catch { continue }
     }
     return "Unknown"
 }
 
 function FindMatchingRoleMapping {
-    param(
-        [array]$RoleMappings,
-        [string]$Role
-    )
+    param([array]$RoleMappings, [string]$Role)
 
-    if (-not $RoleMappings -or $RoleMappings.Count -eq 0) { return "Unknown" }
-    if (-not $Role) { return "Unknown" }
+    if (-not $RoleMappings -or $RoleMappings.Count -eq 0 -or -not $Role) { return "Unknown" }
 
     foreach ($mapping in $RoleMappings) {
         try {
@@ -237,59 +230,49 @@ function FindMatchingRoleMapping {
             if ($mapRoles -is [array] -and $mapRoles -contains $Role) { return $mapName }
             if ($mapRoles -eq $Role) { return $mapName }
         }
-        catch {
-            continue
-        }
+        catch { continue }
     }
     return "Unknown"
 }
 
 function FindAppliedFirewallRules {
-    param(
-        [array]$AccessLists,
-        [string]$RoleOrVlan
-    )
+    param([array]$AccessRules, [string]$Role)
 
-    if (-not $AccessLists -or $AccessLists.Count -eq 0) { return "Default" }
-    if (-not $RoleOrVlan) { return "Default" }
+    if (-not $AccessRules -or $AccessRules.Count -eq 0 -or -not $Role) { return "Default" }
 
     $rules = @()
 
-    foreach ($acl in $AccessLists) {
+    foreach ($rule in $AccessRules) {
         try {
-            $aclName = $acl.name ?? ""
-            $aclRole = $acl.role ?? ""
-            if ($aclName -like "*$RoleOrVlan*" -or $aclRole -eq $RoleOrVlan) {
-                if ($aclName -and -not ($rules -contains $aclName)) {
-                    $rules += $aclName
+            $ruleName = $rule.name ?? ""
+            $ruleRoles = $rule.roles ?? @()
+            if ($ruleName -like "*$Role*" -or $ruleRoles -contains $Role) {
+                if ($ruleName -and -not ($rules -contains $ruleName)) {
+                    $rules += $ruleName
                 }
             }
         }
-        catch {
-            continue
-        }
+        catch { continue }
     }
 
-    if ($rules.Count -eq 0) {
-        return "Default"
-    }
-
-    return ($rules -join "; ")
+    return if ($rules.Count -eq 0) { "Default" } else { ($rules -join "; ") }
 }
 
 Write-Host "Authenticating to Aruba..." -ForegroundColor Cyan
 $arubaSession = Connect-Aruba -Host $ArubaHost -Username $ArubaUsername -Password $ArubaPassword
+if (-not $arubaSession) { Write-Error "Aruba authentication failed"; exit 1 }
 Write-Host "Connected to Aruba" -ForegroundColor Green
 
 Write-Host "Authenticating to ClearPass..." -ForegroundColor Cyan
 $clearPassSession = Connect-ClearPass -Host $ClearPassHost -ClientId $ClearPassClientId -ClientSecret $ClearPassClientSecret
+if (-not $clearPassSession) { Write-Error "ClearPass authentication failed"; exit 1 }
 Write-Host "Connected to ClearPass" -ForegroundColor Green
 
 Write-Host "Fetching data from Aruba..." -ForegroundColor Cyan
-$userTable = Get-ArubaUserTable -Session $arubaSession
-$accessLists = Get-ArubaAccessList -Session $arubaSession
-$usersProcessed = @($userTable.user_table).Count
-Write-Host "Retrieved $usersProcessed user sessions and $($accessLists.Count) access lists from Aruba" -ForegroundColor Green
+$clients = Get-ArubaClients -Session $arubaSession
+$accessRules = Get-ArubaAccessRules -Session $arubaSession
+$roles = Get-ArubaRoles -Session $arubaSession
+Write-Host "Retrieved $($clients.Count) clients, $($accessRules.Count) access rules, and $($roles.Count) roles from Aruba" -ForegroundColor Green
 
 Write-Host "Fetching data from ClearPass..." -ForegroundColor Cyan
 $services = Get-ClearPassServices -Session $clearPassSession
@@ -302,49 +285,44 @@ Write-Host "Correlating data..." -ForegroundColor Cyan
 $correlatedData = @()
 $skippedClients = 0
 
-if ($userTable.user_table) {
-    foreach ($client in $userTable.user_table) {
-        $mac = $client.mac ?? ""
-        $ssid = $client["ssid-name"] ?? ""
-        $role = $client.role ?? ""
-        $authMethod = $client.auth_method ?? ""
-        $vlan = $client.vlan ?? ""
+foreach ($client in $clients) {
+    $mac = $client.mac ?? ""
+    $ssid = $client.ssid_name ?? $client.ssid ?? "N/A"
+    $role = $client.role ?? ""
+    $authMethod = $client.auth_method ?? ""
+    $vlan = $client.vlan_id ?? $client.vlan ?? ""
+    $ip = $client.ip ?? ""
 
-        if (-not $mac) { $skippedClients++; continue }
+    if (-not $mac) { $skippedClients++; continue }
 
-        $serviceName = FindMatchingService -Services $services -AuthMethod $authMethod
+    $serviceName = FindMatchingService -Services $services -AuthMethod $authMethod
+    $roleMappingName = FindMatchingRoleMapping -RoleMappings $roleMappings -Role $role
+    $firewallRules = FindAppliedFirewallRules -AccessRules $accessRules -Role $role
 
-        $roleMappingName = FindMatchingRoleMapping -RoleMappings $roleMappings -Role $role
-
-        $firewallRules = FindAppliedFirewallRules -AccessLists $accessLists -RoleOrVlan ($role, $vlan)
-
-        $authModel = "Unknown"
-        if ($authMethods -and $authMethods.Count -gt 0) {
-            foreach ($method in $authMethods) {
-                try {
-                    $mName = $method.name ?? ""
-                    $mType = $method.type ?? ""
-                    if ($mName -eq $authMethod -or $mType -eq $authMethod) {
-                        $authModel = $mType
-                        break
-                    }
-                }
-                catch {
-                    continue
+    $authModel = $authMethod
+    if ($authMethods -and $authMethods.Count -gt 0) {
+        foreach ($method in $authMethods) {
+            try {
+                if (($method.name ?? "") -eq $authMethod) {
+                    $authModel = $method.type ?? $authMethod
+                    break
                 }
             }
+            catch { continue }
         }
-        if ($authModel -eq "Unknown" -and $authMethod) {
-            $authModel = $authMethod
-        }
+    }
 
-        $correlatedData += [PSCustomObject]@{
-            "Client MAC" = $mac
-            "SSID" = if ($ssid) { $ssid } else { "N/A" }
-            "ClearPass Service" = $serviceName
-            "Auth Model" = $authModel
-            "Applied Aruba Firewall Rules" = $firewallRules
-        }
+    $correlatedData += [PSCustomObject]@{
+        "Client MAC" = $mac
+        "IP Address" = $ip
+        "SSID" = $ssid
+        "Aruba Role" = $role
+        "ClearPass Service" = $serviceName
+        "ClearPass Role Mapping" = $roleMappingName
+        "Auth Method" = $authMethod
+        "Auth Model" = $authModel
+        "VLAN" = $vlan
+        "Applied Aruba Firewall Rules" = $firewallRules
     }
 }
 
@@ -353,5 +331,5 @@ $correlatedData | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
 Write-Host "Data exported to $OutputFile" -ForegroundColor Green
 Write-Host "Total clients processed: $($correlatedData.Count)" -ForegroundColor Cyan
 if ($skippedClients -gt 0) {
-    Write-Host "Skipped $skippedClients clients (missing MAC address)" -ForegroundColor Yellow
+    Write-Warning "Skipped $skippedClients clients (missing MAC address)"
 }

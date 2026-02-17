@@ -4,16 +4,17 @@
 
 PowerShell script that documents Aruba ClearPass policies by correlating:
 
-- **Aruba controller** user sessions (MAC, SSID, role, VLAN, auth method)
-- **ClearPass** services, role mappings, and authentication methods
-- **Applied firewall rules** via access lists
+- **Aruba controller** (via v1 REST API): clients, access rules, roles
+- **ClearPass** (via REST API): services, role mappings, authentication methods
 
 Outputs a CSV with client-level policy documentation for auditing/troubleshooting.
 
 ## Features
 
+- Uses Aruba's v1 REST API (`/v1/clients` etc.) instead of parsing CLI output
+- Uses ClearPass HATEOAS API (`_embedded.services` format)
 - Robust error handling with non-terminating errors
-- Null-safe property access using `??` operator
+- Null-safe property access
 - Validates API response structure before use
 - Skips records with missing MAC addresses and reports count
 - Clear progress messages and warnings
