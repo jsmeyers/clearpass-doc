@@ -165,7 +165,12 @@ function Get-ClearPassServices {
 
     try {
         $response = Invoke-RestMethod -Uri "$($Session.BaseUrl)/api/service" -Method Get -Headers $Session.Headers -SkipCertificateCheck:$SkipCertificateCheck
-        return @($response._embedded.services)
+        if ($response.PSObject.Properties.Name.Contains("_embedded")) {
+            return @($response._embedded.services)
+        } elseif ($response -is [array]) {
+            return @($response)
+        }
+        return @()
     }
     catch {
         Write-Warning "Failed to fetch services from ClearPass: $($_.Exception.Message)"
@@ -178,7 +183,12 @@ function Get-ClearPassRoleMappings {
 
     try {
         $response = Invoke-RestMethod -Uri "$($Session.BaseUrl)/api/role-mapping" -Method Get -Headers $Session.Headers -SkipCertificateCheck:$SkipCertificateCheck
-        return @($response._embedded.role_mappings)
+        if ($response.PSObject.Properties.Name.Contains("_embedded")) {
+            return @($response._embedded.role_mappings)
+        } elseif ($response -is [array]) {
+            return @($response)
+        }
+        return @()
     }
     catch {
         Write-Warning "Failed to fetch role mappings from ClearPass: $($_.Exception.Message)"
@@ -191,7 +201,12 @@ function Get-ClearPassAuthenticationMethods {
 
     try {
         $response = Invoke-RestMethod -Uri "$($Session.BaseUrl)/api/authentication-method" -Method Get -Headers $Session.Headers -SkipCertificateCheck:$SkipCertificateCheck
-        return @($response._embedded.authentication_methods)
+        if ($response.PSObject.Properties.Name.Contains("_embedded")) {
+            return @($response._embedded.authentication_methods)
+        } elseif ($response -is [array]) {
+            return @($response)
+        }
+        return @()
     }
     catch {
         Write-Warning "Failed to fetch authentication methods from ClearPass: $($_.Exception.Message)"
@@ -272,12 +287,22 @@ Write-Host "Fetching data from Aruba..." -ForegroundColor Cyan
 $clients = Get-ArubaClients -Session $arubaSession
 $accessRules = Get-ArubaAccessRules -Session $arubaSession
 $roles = Get-ArubaRoles -Session $arubaSession
+
+if ($null -eq $clients) { $clients = @() }
+if ($null -eq $accessRules) { $accessRules = @() }
+if ($null -eq $roles) { $roles = @() }
+
 Write-Host "Retrieved $($clients.Count) clients, $($accessRules.Count) access rules, and $($roles.Count) roles from Aruba" -ForegroundColor Green
 
 Write-Host "Fetching data from ClearPass..." -ForegroundColor Cyan
 $services = Get-ClearPassServices -Session $clearPassSession
 $roleMappings = Get-ClearPassRoleMappings -Session $clearPassSession
 $authMethods = Get-ClearPassAuthenticationMethods -Session $clearPassSession
+
+if ($null -eq $services) { $services = @() }
+if ($null -eq $roleMappings) { $roleMappings = @() }
+if ($null -eq $authMethods) { $authMethods = @() }
+
 Write-Host "Retrieved $($services.Count) services, $($roleMappings.Count) role mappings, and $($authMethods.Count) auth methods from ClearPass" -ForegroundColor Green
 
 Write-Host "Correlating data..." -ForegroundColor Cyan
@@ -300,7 +325,7 @@ foreach ($client in $clients) {
     $firewallRules = FindAppliedFirewallRules -AccessRules $accessRules -Role $role
 
     $authModel = $authMethod
-    if ($authMethods -and $authMethods.Count -gt 0) {
+    if ($authMethods.Count -gt 0) {
         foreach ($method in $authMethods) {
             try {
                 if (($method.name ?? "") -eq $authMethod) {
