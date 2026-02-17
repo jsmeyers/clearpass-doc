@@ -18,8 +18,15 @@ param(
     [string]$ClearPassClientSecret,
 
     [Parameter(Mandatory=$false)]
-    [string]$OutputFile = "correlated_clients.csv"
+    [string]$OutputFile = "correlated_clients.csv",
+
+    [Parameter(Mandatory=$false)]
+    [switch]$SkipCertificateCheck = $true
 )
+
+$ErrorActionPreference = "Stop"
+$verbosePref = $VerbosePreference
+$VerbosePreference = "Continue"
 
 $ErrorActionPreference = "Stop"
 
@@ -112,11 +119,16 @@ function Get-ArubaUserTable {
     $url = "$($Session.BaseUrl)/v1/api/show-command?command=show+user-table"
 
     try {
-        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $Session.Headers -SkipCertificateCheck
+        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $Session.Headers -SkipCertificateCheck:$SkipCertificateCheck
+        if ($null -eq $response -or -not $response.PSObject.Properties.Name.Contains("user_table")) {
+            Write-Warning "No user_table found in Aruba response"
+            return [PSCustomObject]@{ user_table = @() }
+        }
         return $response
     }
     catch {
-        throw "Failed to fetch user table from Aruba: $_"
+        Write-Error "Failed to fetch user table from Aruba: $($_.Exception.Message)"
+        return [PSCustomObject]@{ user_table = @() }
     }
 }
 
@@ -126,11 +138,16 @@ function Get-ArubaAccessList {
     $url = "$($Session.BaseUrl)/v1/api/show-command?command=show+ip+access-list"
 
     try {
-        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $Session.Headers -SkipCertificateCheck
-        return $response
+        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $Session.Headers -SkipCertificateCheck:$SkipCertificateCheck
+        if ($null -eq $response) {
+            Write-Warning "No response from Aruba access list query"
+            return @()
+        }
+        return @($response)
     }
     catch {
-        throw "Failed to fetch access list from Aruba: $_"
+        Write-Error "Failed to fetch access list from Aruba: $($_.Exception.Message)"
+        return @()
     }
 }
 
@@ -140,11 +157,12 @@ function Get-ClearPassServices {
     $url = "$($Session.BaseUrl)/api/service"
 
     try {
-        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $Session.Headers -SkipCertificateCheck
-        return $response
+        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $Session.Headers -SkipCertificateCheck:$SkipCertificateCheck
+        return @($response._embedded.services)
     }
     catch {
-        throw "Failed to fetch services from ClearPass: $_"
+        Write-Error "Failed to fetch services from ClearPass: $($_.Exception.Message)"
+        return @()
     }
 }
 
@@ -154,11 +172,12 @@ function Get-ClearPassRoleMappings {
     $url = "$($Session.BaseUrl)/api/role-mapping"
 
     try {
-        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $Session.Headers -SkipCertificateCheck
-        return $response
+        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $Session.Headers -SkipCertificateCheck:$SkipCertificateCheck
+        return @($response._embedded.role_mappings)
     }
     catch {
-        throw "Failed to fetch role mappings from ClearPass: $_"
+        Write-Error "Failed to fetch role mappings from ClearPass: $($_.Exception.Message)"
+        return @()
     }
 }
 
@@ -168,11 +187,12 @@ function Get-ClearPassAuthenticationMethods {
     $url = "$($Session.BaseUrl)/api/authentication-method"
 
     try {
-        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $Session.Headers -SkipCertificateCheck
-        return $response
+        $response = Invoke-RestMethod -Uri $url -Method Get -Headers $Session.Headers -SkipCertificateCheck:$SkipCertificateCheck
+        return @($response._embedded.authentication_methods)
     }
     catch {
-        throw "Failed to fetch authentication methods from ClearPass: $_"
+        Write-Error "Failed to fetch authentication methods from ClearPass: $($_.Exception.Message)"
+        return @()
     }
 }
 
@@ -182,9 +202,19 @@ function FindMatchingService {
         [string]$AuthMethod
     )
 
+    if (-not $Services -or $Services.Count -eq 0) { return "Unknown" }
+    if (-not $AuthMethod) { return "Unknown" }
+
     foreach ($service in $Services) {
-        if ($service.auth_method -eq $AuthMethod -or $service.name -like "*$AuthMethod*") {
-            return $service.name
+        try {
+            $svcName = $service.name ?? "Unknown"
+            $svcAuth = $service.auth_method ?? ""
+            if ($svcAuth -eq $AuthMethod -or $svcName -like "*$AuthMethod*") {
+                return $svcName
+            }
+        }
+        catch {
+            continue
         }
     }
     return "Unknown"
@@ -196,9 +226,19 @@ function FindMatchingRoleMapping {
         [string]$Role
     )
 
+    if (-not $RoleMappings -or $RoleMappings.Count -eq 0) { return "Unknown" }
+    if (-not $Role) { return "Unknown" }
+
     foreach ($mapping in $RoleMappings) {
-        if ($mapping.name -eq $Role -or $mapping.roles -contains $Role) {
-            return $mapping.name
+        try {
+            $mapName = $mapping.name ?? ""
+            $mapRoles = $mapping.roles ?? @()
+            if ($mapName -eq $Role) { return $mapName }
+            if ($mapRoles -is [array] -and $mapRoles -contains $Role) { return $mapName }
+            if ($mapRoles -eq $Role) { return $mapName }
+        }
+        catch {
+            continue
         }
     }
     return "Unknown"
@@ -210,13 +250,23 @@ function FindAppliedFirewallRules {
         [string]$RoleOrVlan
     )
 
+    if (-not $AccessLists -or $AccessLists.Count -eq 0) { return "Default" }
+    if (-not $RoleOrVlan) { return "Default" }
+
     $rules = @()
 
-    if ($AccessLists -and $AccessLists.Count -gt 0) {
-        foreach ($acl in $AccessLists) {
-            if ($acl.name -like "*$RoleOrVlan*" -or $acl.role -eq $RoleOrVlan) {
-                $rules += $acl.name
+    foreach ($acl in $AccessLists) {
+        try {
+            $aclName = $acl.name ?? ""
+            $aclRole = $acl.role ?? ""
+            if ($aclName -like "*$RoleOrVlan*" -or $aclRole -eq $RoleOrVlan) {
+                if ($aclName -and -not ($rules -contains $aclName)) {
+                    $rules += $aclName
+                }
             }
+        }
+        catch {
+            continue
         }
     }
 
@@ -238,7 +288,8 @@ Write-Host "Connected to ClearPass" -ForegroundColor Green
 Write-Host "Fetching data from Aruba..." -ForegroundColor Cyan
 $userTable = Get-ArubaUserTable -Session $arubaSession
 $accessLists = Get-ArubaAccessList -Session $arubaSession
-Write-Host "Retrieved $($userTable.Count) user sessions and $($accessLists.Count) access lists from Aruba" -ForegroundColor Green
+$usersProcessed = @($userTable.user_table).Count
+Write-Host "Retrieved $usersProcessed user sessions and $($accessLists.Count) access lists from Aruba" -ForegroundColor Green
 
 Write-Host "Fetching data from ClearPass..." -ForegroundColor Cyan
 $services = Get-ClearPassServices -Session $clearPassSession
@@ -249,16 +300,17 @@ Write-Host "Retrieved $($services.Count) services, $($roleMappings.Count) role m
 Write-Host "Correlating data..." -ForegroundColor Cyan
 
 $correlatedData = @()
+$skippedClients = 0
 
 if ($userTable.user_table) {
     foreach ($client in $userTable.user_table) {
-        $mac = $client.mac
-        $ssid = $client["ssid-name"]
-        $role = $client.role
-        $authMethod = $client.auth_method
-        $vlan = $client.vlan
+        $mac = $client.mac ?? ""
+        $ssid = $client["ssid-name"] ?? ""
+        $role = $client.role ?? ""
+        $authMethod = $client.auth_method ?? ""
+        $vlan = $client.vlan ?? ""
 
-        if (-not $mac) { continue }
+        if (-not $mac) { $skippedClients++; continue }
 
         $serviceName = FindMatchingService -Services $services -AuthMethod $authMethod
 
@@ -269,9 +321,16 @@ if ($userTable.user_table) {
         $authModel = "Unknown"
         if ($authMethods -and $authMethods.Count -gt 0) {
             foreach ($method in $authMethods) {
-                if ($method.name -eq $authMethod -or $method.type -eq $authMethod) {
-                    $authModel = $method.type
-                    break
+                try {
+                    $mName = $method.name ?? ""
+                    $mType = $method.type ?? ""
+                    if ($mName -eq $authMethod -or $mType -eq $authMethod) {
+                        $authModel = $mType
+                        break
+                    }
+                }
+                catch {
+                    continue
                 }
             }
         }
@@ -293,3 +352,6 @@ Write-Host "Exporting to CSV..." -ForegroundColor Cyan
 $correlatedData | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
 Write-Host "Data exported to $OutputFile" -ForegroundColor Green
 Write-Host "Total clients processed: $($correlatedData.Count)" -ForegroundColor Cyan
+if ($skippedClients -gt 0) {
+    Write-Host "Skipped $skippedClients clients (missing MAC address)" -ForegroundColor Yellow
+}
